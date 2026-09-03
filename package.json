@@ -1,0 +1,14 @@
+{
+  "name": "daily-habit",
+  "version": "1.0.0",
+  "description": "Daily Habit — streak tracker for good and bad habits",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
