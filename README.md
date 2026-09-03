@@ -53,28 +53,37 @@ Health check: `GET /healthz` → `200 ok`. The server listens on `$PORT`
 
 ## Reminders & habit windows (push notifications)
 
-Each habit can have a **daily reminder hour**, and good habits can have a
-**window** (e.g. 7:00–8:00). Signed-in users who enable notifications on a
-device (account button → *Notifications on this device* → Enable) get:
+Each habit can have a **daily reminder time**, and good habits can have a
+**window** (e.g. 7:15–8:00 AM). Times are picked in 12-hour format in
+5-minute steps. Signed-in users who enable notifications on a device
+(account button → *Notifications on this device* → Enable) get:
 
-- a reminder at the reminder hour,
+- a reminder at the reminder time,
 - "Time for …" when a window opens and "… window ended — did you do it?" when
   it closes — both skipped automatically once the habit is checked in for the day.
 
-Times are whole hours in the **device's** time zone (each device records its
-zone when it enables notifications). Notifications are real Web Push: they
-arrive with the site closed. On iPhone/iPad the site must first be added to
-the Home Screen (Share → Add to Home Screen) and opened from there — the app
-ships a manifest and icons so it installs cleanly.
+Times are in the **device's** time zone (each device records its zone when it
+enables notifications). Notifications are real Web Push: they arrive with the
+site closed. On iPhone/iPad the site must first be added to the Home Screen
+(Share → Add to Home Screen) and opened from there — the app ships a manifest
+and icons so it installs cleanly.
 
 Server side: VAPID keys are generated once and stored in the database (or
 set `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY`); set `VAPID_SUBJECT` to your
-site URL or a `mailto:` address. A ticker runs every 30 s and sends at most
-one notification per device, habit and kind per hour; expired subscriptions
-are pruned automatically. Endpoints: `GET /api/push/vapid`,
+site URL or a `mailto:` address. A ticker runs every 30 s from an in-memory
+copy of the subscriptions and schedules (refreshed whenever a user writes,
+and every 30 minutes as a safety net), so an idle server does not poll the
+database — important on serverless Postgres such as Neon, whose free plan
+bills compute hours while the database is awake. A time that falls due is
+delivered within 5 minutes, once per device, habit and kind per day; expired
+subscriptions are pruned automatically. Endpoints: `GET /api/push/vapid`,
 `POST /api/push/subscribe|unsubscribe|test`, `GET /api/push/status`;
 assets: `/sw.js`, `/manifest.webmanifest`, `/icon-192.png`, `/icon-512.png`,
 `/apple-touch-icon.png`.
+
+Data model: `remindMin`, `winStartMin`, `winEndMin` are minutes since
+midnight (0–1439). Databases created by v3.1 (whole-hour columns) are
+migrated automatically on first start.
 
 ## How accounts work
 

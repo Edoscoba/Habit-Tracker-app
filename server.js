@@ -86,9 +86,10 @@ class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_push_user ON push_subs(user_id);
       CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
     `);
-    // schedule columns (added in v3.1; ALTER only if missing)
+    // schedule columns (minutes since midnight; added in v3.2 — ALTER only if missing)
     const cols = new Set(this.db.prepare('PRAGMA table_info(habits)').all().map(r => r.name));
-    for (const c of ['remind_at', 'win_start', 'win_end']) if (!cols.has(c)) this.db.exec('ALTER TABLE habits ADD COLUMN ' + c + ' INTEGER');
+    for (const c of SCHED_COLS) if (!cols.has(c)) this.db.exec('ALTER TABLE habits ADD COLUMN ' + c + ' INTEGER');
+    if (cols.has('remind_at')) this.db.exec(SQL_MIGRATE_HOURS);   // v3.1 stored whole hours — convert once
   }
   async getUserByEmail(email){
     return this.db.prepare('SELECT id,pass_salt,pass_hash FROM users WHERE email=?').get(email) || null;
@@ -126,9 +127,9 @@ class SqliteStore {
   async countHabits(userId){ return this.db.prepare('SELECT COUNT(*) AS n FROM habits WHERE user_id=?').get(userId).n; }
   async habitExists(userId, id){ return !!this.db.prepare('SELECT 1 AS x FROM habits WHERE user_id=? AND id=?').get(userId, id); }
   async upsertHabit(userId, c){
-    this.db.prepare(`INSERT INTO habits(user_id,id,name,type,emoji,color,created_at,ord,remind_at,win_start,win_end) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(user_id,id) DO UPDATE SET name=excluded.name,type=excluded.type,emoji=excluded.emoji,color=excluded.color,created_at=excluded.created_at,ord=excluded.ord,remind_at=excluded.remind_at,win_start=excluded.win_start,win_end=excluded.win_end`)
-      .run(userId, c.id, c.name, c.type, c.emoji, c.color, c.createdAt, c.ord, c.remindAt, c.winStart, c.winEnd);
+    this.db.prepare(`INSERT INTO habits(user_id,id,name,type,emoji,color,created_at,ord,remind_min,win_start_min,win_end_min) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(user_id,id) DO UPDATE SET name=excluded.name,type=excluded.type,emoji=excluded.emoji,color=excluded.color,created_at=excluded.created_at,ord=excluded.ord,remind_min=excluded.remind_min,win_start_min=excluded.win_start_min,win_end_min=excluded.win_end_min`)
+      .run(userId, c.id, c.name, c.type, c.emoji, c.color, c.createdAt, c.ord, c.remindMin, c.winStartMin, c.winEndMin);
   }
   async deleteHabit(userId, id){
     this.db.exec('BEGIN');
@@ -265,7 +266,8 @@ class PgStore {
   }
 
   async tryCandidate(Pool, cand){
-    const pool = new Pool(Object.assign({}, cand.config, { max: 8, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 }));
+    // 15 s connect budget: serverless Postgres (Neon) scales to zero when idle and needs a moment to wake
+    const pool = new Pool(Object.assign({}, cand.config, { max: 8, idleTimeoutMillis: 30000, connectionTimeoutMillis: 15000 }));
     try {
       const probe = await pool.connect();
       try { await probe.query('SELECT 1'); } finally { probe.release(); }
@@ -336,10 +338,13 @@ class PgStore {
           tz TEXT NOT NULL DEFAULT 'UTC', created_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_push_user ON push_subs(user_id);
         CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-        ALTER TABLE habits ADD COLUMN IF NOT EXISTS remind_at INTEGER;
-        ALTER TABLE habits ADD COLUMN IF NOT EXISTS win_start INTEGER;
-        ALTER TABLE habits ADD COLUMN IF NOT EXISTS win_end INTEGER;
+        ALTER TABLE habits ADD COLUMN IF NOT EXISTS remind_min INTEGER;
+        ALTER TABLE habits ADD COLUMN IF NOT EXISTS win_start_min INTEGER;
+        ALTER TABLE habits ADD COLUMN IF NOT EXISTS win_end_min INTEGER;
       `);
+      // v3.1 stored whole hours in remind_at/win_start/win_end — convert once, then leave those columns empty
+      const legacy = await c.query("SELECT 1 FROM information_schema.columns WHERE table_name='habits' AND column_name='remind_at'");
+      if (legacy.rows.length) await c.query(SQL_MIGRATE_HOURS);
     } finally { c.release(); }
   }
   async q(text, params){ return (await this.pool.query(text, params)).rows; }
@@ -381,7 +386,7 @@ class PgStore {
   async countHabits(userId){ return Number((await this.q('SELECT COUNT(*) AS n FROM habits WHERE user_id=$1', [userId]))[0].n); }
   async habitExists(userId, id){ return (await this.q('SELECT 1 AS x FROM habits WHERE user_id=$1 AND id=$2', [userId, id])).length > 0; }
   async upsertHabit(userId, c){
-    await this.q(PG_UPSERT_HABIT, [userId, c.id, c.name, c.type, c.emoji, c.color, c.createdAt, c.ord, c.remindAt, c.winStart, c.winEnd]);
+    await this.q(PG_UPSERT_HABIT, [userId, c.id, c.name, c.type, c.emoji, c.color, c.createdAt, c.ord, c.remindMin, c.winStartMin, c.winEndMin]);
   }
   async deleteHabit(userId, id){
     const c = await this.pool.connect();
@@ -423,7 +428,7 @@ class PgStore {
       for (const [id, h] of Object.entries(habits)) {
         if (existing + nH >= MAX_HABITS) break;
         const cl = cleanHabit(id, h); if (!cl) continue;
-        await run(PG_UPSERT_HABIT, [userId, cl.id, cl.name, cl.type, cl.emoji, cl.color, cl.createdAt, cl.ord, cl.remindAt, cl.winStart, cl.winEnd]);
+        await run(PG_UPSERT_HABIT, [userId, cl.id, cl.name, cl.type, cl.emoji, cl.color, cl.createdAt, cl.ord, cl.remindMin, cl.winStartMin, cl.winEndMin]);
         nH++;
         const days = (logs[id] && typeof logs[id] === 'object' && logs[id].days) || {};
         for (const [date, val] of Object.entries(days)) {
@@ -516,12 +521,19 @@ const RE_ID = /^[A-Za-z0-9_-]{1,40}$/;
 const RE_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const VALS = ['', 'y', 'n', 's'];
 
-/* Schedule fields: whole hours 0–23 or null. remindAt = daily reminder;
- * winStart/winEnd = the hours a GOOD habit is meant to happen (end > start). */
-function cleanHour(v){
+/* Schedule fields: minutes since midnight (0–1439) or null. remindMin = daily
+ * reminder; winStartMin/winEndMin = when a GOOD habit is meant to happen
+ * (end > start). v3.1 clients sent whole hours as remindAt/winStart/winEnd —
+ * still accepted (×60) so an open tab of the old page keeps working. */
+function cleanMin(v){
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
-  return Number.isInteger(n) && n >= 0 && n <= 23 ? n : undefined;   // undefined = invalid
+  return Number.isInteger(n) && n >= 0 && n < 1440 ? n : undefined;   // undefined = invalid
+}
+function schedField(h, minKey, hourKey){
+  if (minKey in h) return cleanMin(h[minKey]);
+  const n = cleanMin(h[hourKey]);                                        // legacy whole hours
+  return n === null || n === undefined ? n : (n <= 23 ? n * 60 : undefined);
 }
 function cleanHabit(id, h){
   if (!RE_ID.test(id) || !h || typeof h !== 'object') return null;
@@ -532,39 +544,65 @@ function cleanHabit(id, h){
   let color = Number(h.color); color = Number.isInteger(color) && color >= 0 && color <= 7 ? color : 0;
   const createdAt = RE_DATE.test(String(h.createdAt || '')) ? h.createdAt : nowIso().slice(0, 10);
   let ord = Number(h.order); ord = Number.isFinite(ord) && Math.abs(ord) <= 1e6 ? Math.trunc(ord) : null;
-  const remindAt = cleanHour(h.remindAt);
-  let winStart = cleanHour(h.winStart), winEnd = cleanHour(h.winEnd);
-  if (remindAt === undefined || winStart === undefined || winEnd === undefined) return null;   // out-of-range hour
-  if (type !== 'good') { winStart = null; winEnd = null; }                                    // windows are for good habits
-  if ((winStart === null) !== (winEnd === null)) return null;                                 // both or neither
-  if (winStart !== null && winEnd <= winStart) return null;                                   // end must be after start
-  return { id, name, type, emoji, color, createdAt, ord, remindAt, winStart, winEnd };
+  const remindMin = schedField(h, 'remindMin', 'remindAt');
+  let winStartMin = schedField(h, 'winStartMin', 'winStart'), winEndMin = schedField(h, 'winEndMin', 'winEnd');
+  if (remindMin === undefined || winStartMin === undefined || winEndMin === undefined) return null;   // out-of-range time
+  if (type !== 'good') { winStartMin = null; winEndMin = null; }                                      // windows are for good habits
+  if ((winStartMin === null) !== (winEndMin === null)) return null;                                   // both or neither
+  if (winStartMin !== null && winEndMin <= winStartMin) return null;                                  // end must be after start
+  return { id, name, type, emoji, color, createdAt, ord, remindMin, winStartMin, winEndMin };
 }
-const HABIT_COLS = 'id,name,type,emoji,color,created_at,ord,remind_at,win_start,win_end';
-const PG_UPSERT_HABIT = `INSERT INTO habits(user_id,id,name,type,emoji,color,created_at,ord,remind_at,win_start,win_end) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-  ON CONFLICT(user_id,id) DO UPDATE SET name=EXCLUDED.name,type=EXCLUDED.type,emoji=EXCLUDED.emoji,color=EXCLUDED.color,created_at=EXCLUDED.created_at,ord=EXCLUDED.ord,remind_at=EXCLUDED.remind_at,win_start=EXCLUDED.win_start,win_end=EXCLUDED.win_end`;
+const SCHED_COLS = ['remind_min', 'win_start_min', 'win_end_min'];
+const SQL_MIGRATE_HOURS = `UPDATE habits SET remind_min=COALESCE(remind_min, remind_at*60), win_start_min=COALESCE(win_start_min, win_start*60),
+  win_end_min=COALESCE(win_end_min, win_end*60), remind_at=NULL, win_start=NULL, win_end=NULL
+  WHERE remind_at IS NOT NULL OR win_start IS NOT NULL OR win_end IS NOT NULL`;
+const HABIT_COLS = 'id,name,type,emoji,color,created_at,ord,remind_min,win_start_min,win_end_min';
+const PG_UPSERT_HABIT = `INSERT INTO habits(user_id,id,name,type,emoji,color,created_at,ord,remind_min,win_start_min,win_end_min) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+  ON CONFLICT(user_id,id) DO UPDATE SET name=EXCLUDED.name,type=EXCLUDED.type,emoji=EXCLUDED.emoji,color=EXCLUDED.color,created_at=EXCLUDED.created_at,ord=EXCLUDED.ord,remind_min=EXCLUDED.remind_min,win_start_min=EXCLUDED.win_start_min,win_end_min=EXCLUDED.win_end_min`;
 function habitRowToObj(r){
   const h = { name: r.name, type: r.type, emoji: r.emoji, color: r.color, createdAt: r.created_at };
   if (r.ord !== null && r.ord !== undefined) h.order = r.ord;
-  if (r.remind_at !== null && r.remind_at !== undefined) h.remindAt = r.remind_at;
-  if (r.win_start !== null && r.win_start !== undefined) h.winStart = r.win_start;
-  if (r.win_end !== null && r.win_end !== undefined) h.winEnd = r.win_end;
+  if (r.remind_min !== null && r.remind_min !== undefined) h.remindMin = r.remind_min;
+  if (r.win_start_min !== null && r.win_start_min !== undefined) h.winStartMin = r.win_start_min;
+  if (r.win_end_min !== null && r.win_end_min !== undefined) h.winEndMin = r.win_end_min;
   return h;
 }
 
 /* =========================================================================
  * Web Push reminders
- * Habit schedules are whole hours in the DEVICE's local time zone (each
- * subscription records its tz). Every 30 s the ticker checks, for each
- * subscribed device, whether its local clock is in the first five minutes
- * of an hour that has a due reminder / window start / window end, and sends
- * at most one notification per device+habit+kind per hour. Anything already
- * checked in as done today is skipped.
+ * Habit times are minutes since midnight in the DEVICE's local time zone
+ * (each subscription records its tz). Every 30 s the ticker checks, for each
+ * subscribed device, whether a reminder / window start / window end fell due
+ * within the last CATCH_MIN minutes, and sends at most one notification per
+ * device+habit+kind+time per day. Anything already checked in as done today
+ * is skipped.
+ *
+ * The ticker works from an in-memory copy of the subscriptions and of each
+ * subscribed user's habits/logs, invalidated by the API whenever that user
+ * writes, and refreshed after TICK_CACHE_MS as a safety net — so an idle
+ * server touches the database a couple of times an hour instead of every
+ * tick (serverless Postgres such as Neon bills compute time while awake).
  * ========================================================================= */
 let webpush = null;
 let vapid = null;                 // { publicKey, subject }
 let pushTransport = null;         // (sub, payload) => Promise — swappable for tests
 const sentKeys = new Map();       // dedupe: key -> timestamp
+const CATCH_MIN = 5;              // a due time is still delivered this many minutes late (restarts, slow ticks)
+const TICK_CACHE_MS = 30 * 60e3;
+const tickCache = { subs: null, subsAt: 0, users: new Map(), reads: 0 };
+function touchUser(userId){ tickCache.users.delete(userId); }
+function touchSubs(){ tickCache.subs = null; }
+async function cachedSubs(){
+  const t = Date.now();
+  if (!tickCache.subs || t - tickCache.subsAt > TICK_CACHE_MS) { tickCache.subs = await store.listPushSubs(null); tickCache.subsAt = t; tickCache.reads++; }
+  return tickCache.subs;
+}
+async function cachedUserData(userId){
+  const t = Date.now();
+  let e = tickCache.users.get(userId);
+  if (!e || t - e.at > TICK_CACHE_MS) { e = { data: await store.getData(userId), at: t }; tickCache.users.set(userId, e); tickCache.reads++; }
+  return e.data;
+}
 
 async function initPush(){
   try { webpush = require('web-push'); } catch (e) { console.error('web-push not installed — notifications disabled'); return; }
@@ -594,22 +632,25 @@ function localParts(date, tz){
     return { ymd: p.year + '-' + p.month + '-' + p.day, hour: Number(p.hour) % 24, minute: Number(p.minute) };
   } catch (e) { return null; }
 }
-const fmtHour = (h) => h + ':00';
+function fmt12(m){ const h = Math.floor(m / 60), mm = m % 60; return (h % 12 || 12) + ':' + String(mm).padStart(2, '0') + ' ' + (h < 12 ? 'AM' : 'PM'); }
 
-function dueNotifications(habits, logs, hour, ymd){
+/* nowMin = the device's local minutes since midnight. A time is due from the
+ * minute it arrives until CATCH_MIN minutes later; each returned item carries
+ * the scheduled minute (`at`) so the caller can dedupe per day. */
+function dueNotifications(habits, logs, nowMin, ymd){
   const out = [];
+  const due = (t) => Number.isInteger(t) && nowMin >= t && nowMin < t + CATCH_MIN;
   for (const [id, h] of Object.entries(habits || {})) {
     const v = (((logs || {})[id] || {}).days || {})[ymd];
-    const done = v === 'y';
-    if (done) continue;   // already checked in today — nothing to nag about
+    if (v === 'y') continue;   // already checked in today — nothing to nag about
     const label = (h.emoji ? h.emoji + ' ' : '') + h.name;
-    if (Number.isInteger(h.remindAt) && h.remindAt === hour) {
-      out.push({ habitId: id, kind: 'remind', title: label,
+    if (due(h.remindMin)) {
+      out.push({ habitId: id, kind: 'remind', at: h.remindMin, title: label,
         body: h.type === 'bad' ? 'Daily check-in: staying clean today? Tap to log it.' : 'Daily reminder — have you done it today? Tap to check in.' });
     }
-    if (h.type === 'good' && Number.isInteger(h.winStart) && Number.isInteger(h.winEnd)) {
-      if (h.winStart === hour) out.push({ habitId: id, kind: 'start', title: 'Time for ' + label, body: 'Your window is open until ' + fmtHour(h.winEnd) + '. Go for it!' });
-      if (h.winEnd === hour) out.push({ habitId: id, kind: 'end', title: label + ' — window ended', body: 'Did you do it? Tap to check in and move on.' });
+    if (h.type === 'good' && Number.isInteger(h.winStartMin) && Number.isInteger(h.winEndMin)) {
+      if (due(h.winStartMin)) out.push({ habitId: id, kind: 'start', at: h.winStartMin, title: 'Time for ' + label, body: 'Your window is open until ' + fmt12(h.winEndMin) + '. Go for it!' });
+      if (due(h.winEndMin)) out.push({ habitId: id, kind: 'end', at: h.winEndMin, title: label + ' — window ended', body: 'Did you do it? Tap to check in and move on.' });
     }
   }
   return out;
@@ -620,7 +661,7 @@ function pruneSent(){ const cutoff = Date.now() - 26 * 3600e3; for (const [k, t]
 async function runTick(now){
   now = now || new Date();
   if (!storageReady || !pushTransport) return { sent: 0, evaluated: 0 };
-  const subs = await store.listPushSubs(null);
+  const subs = await cachedSubs();
   if (!subs.length) return { sent: 0, evaluated: 0 };
   const byUser = new Map();
   for (const s of subs) { if (!byUser.has(s.user_id)) byUser.set(s.user_id, []); byUser.get(s.user_id).push(s); }
@@ -629,14 +670,10 @@ async function runTick(now){
     let data = null;
     for (const s of list) {
       const lp = localParts(now, s.tz || 'UTC'); if (!lp) continue;
-      if (lp.minute > 4) continue;                                  // first five minutes of the hour only
-      const hourKey = lp.ymd + 'T' + lp.hour;
-      const evalKey = 'e:' + s.endpoint + ':' + hourKey;
-      if (sentKeys.has(evalKey)) continue;                          // this device already handled this hour
-      sentKeys.set(evalKey, Date.now()); evaluated++;
-      if (!data) data = await store.getData(userId);
-      for (const n of dueNotifications(data.habits, data.logs, lp.hour, lp.ymd)) {
-        const key = 'n:' + s.endpoint + ':' + n.habitId + ':' + n.kind + ':' + hourKey;
+      evaluated++;
+      if (!data) data = await cachedUserData(userId);
+      for (const n of dueNotifications(data.habits, data.logs, lp.hour * 60 + lp.minute, lp.ymd)) {
+        const key = 'n:' + s.endpoint + ':' + n.habitId + ':' + n.kind + ':' + lp.ymd + ':' + n.at;
         if (sentKeys.has(key)) continue;
         sentKeys.set(key, Date.now());
         try {
@@ -644,7 +681,7 @@ async function runTick(now){
           sent++;
         } catch (e) {
           const code = e && e.statusCode;
-          if (code === 404 || code === 410) { await store.deletePushSub(s.endpoint).catch(() => {}); console.error('Push subscription expired — removed'); }
+          if (code === 404 || code === 410) { await store.deletePushSub(s.endpoint).catch(() => {}); touchSubs(); console.error('Push subscription expired — removed'); }
           else console.error('Push send failed: ' + errDetail(e));
         }
       }
@@ -808,7 +845,7 @@ async function handleApi(req, res, pathname){
     const auth = s && s.keys && typeof s.keys.auth === 'string' ? s.keys.auth : '';
     if (!/^https:\/\/\S{1,1500}$/.test(endpoint) || !p256dh || !auth || p256dh.length > 300 || auth.length > 100) return send(res, 400, { error: 'bad_subscription' });
     const tz = (typeof b.tz === 'string' && b.tz.length <= 64 && validTz(b.tz)) ? b.tz : 'UTC';
-    await store.upsertPushSub(uid, endpoint, p256dh, auth, tz);
+    await store.upsertPushSub(uid, endpoint, p256dh, auth, tz); touchSubs();
     return send(res, 200, { ok: true, tz });
   }
   if (pathname === '/api/push/unsubscribe' && method === 'POST') {
@@ -816,7 +853,7 @@ async function handleApi(req, res, pathname){
     const endpoint = typeof b.endpoint === 'string' ? b.endpoint : '';
     if (!endpoint) return send(res, 400, { error: 'bad_endpoint' });
     const mine = (await store.listPushSubs(uid)).some(s => s.endpoint === endpoint);
-    if (mine) await store.deletePushSub(endpoint);
+    if (mine) { await store.deletePushSub(endpoint); touchSubs(); }
     return send(res, 200, { ok: true });
   }
   if (pathname === '/api/push/status' && method === 'GET') {
@@ -829,7 +866,7 @@ async function handleApi(req, res, pathname){
     let sent = 0;
     for (const s of subs) {
       try { await pushTransport(s, { title: '🔥 Daily Habit', body: 'Notifications are working on this device.', tag: 'dh-test', url: '/' }); sent++; }
-      catch (e) { const code = e && e.statusCode; if (code === 404 || code === 410) await store.deletePushSub(s.endpoint).catch(() => {}); }
+      catch (e) { const code = e && e.statusCode; if (code === 404 || code === 410) { await store.deletePushSub(s.endpoint).catch(() => {}); touchSubs(); } }
     }
     return send(res, 200, { sent });
   }
@@ -841,6 +878,7 @@ async function handleApi(req, res, pathname){
       logs: (b && typeof b.logs === 'object' && b.logs) || {},
       notes: (b && typeof b.notes === 'object' && b.notes) || {}
     });
+    touchUser(uid);
     return send(res, 200, { imported: counts });
   }
 
@@ -850,11 +888,11 @@ async function handleApi(req, res, pathname){
     const c = cleanHabit(habitMatch[1], b);
     if (!c) return send(res, 400, { error: 'bad_habit' });
     if (!(await store.habitExists(uid, c.id)) && (await store.countHabits(uid)) >= MAX_HABITS) return send(res, 409, { error: 'habit_limit' });
-    await store.upsertHabit(uid, c);
+    await store.upsertHabit(uid, c); touchUser(uid);
     return send(res, 200, { ok: true });
   }
   if (habitMatch && method === 'DELETE') {
-    await store.deleteHabit(uid, habitMatch[1]);
+    await store.deleteHabit(uid, habitMatch[1]); touchUser(uid);
     return send(res, 200, { ok: true });
   }
 
@@ -862,7 +900,7 @@ async function handleApi(req, res, pathname){
     const b = await readBody(req);
     const habitId = String(b.habitId || ''), date = String(b.date || ''), val = b.val;
     if (!RE_ID.test(habitId) || !RE_DATE.test(date) || VALS.indexOf(val) === -1) return send(res, 400, { error: 'bad_day' });
-    await store.setDay(uid, habitId, date, val);
+    await store.setDay(uid, habitId, date, val); touchUser(uid);
     return send(res, 200, { ok: true });
   }
 
@@ -907,8 +945,8 @@ const server = http.createServer((req, res) => {
 });
 
 module.exports = { PgStore, SqliteStore, dockerGatewayIp, sanitizeUrl, internalNameCandidates,
-  cleanHabit, dueNotifications, localParts, runTick, setPushTransport, makeIconPng, initPush,
-  _test: { setStore(s){ store = s; storageReady = true; }, sentKeys } };
+  cleanHabit, dueNotifications, localParts, runTick, setPushTransport, makeIconPng, initPush, touchUser, touchSubs,
+  _test: { setStore(s){ store = s; storageReady = true; }, sentKeys, tickCache } };
 
 /* Storage lifecycle: serve immediately; bring storage up in the background
  * and retry until it connects. Guests are unaffected while storage is down —
