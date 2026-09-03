@@ -189,7 +189,14 @@ class PgStore {
     for (const ssl of sslOrder) out.push(mk(url, ssl));
     let u = null; try { u = new URL(url); } catch (e) {}
     const host = u ? u.hostname : '';
-    if (u && (host === 'localhost' || host === '127.0.0.1' || host === '::1')) {
+    // Managed DBs on single-host platforms (GuildServer) are published on
+    // the HOST — often advertised via the platform's public domain or
+    // localhost. A container can't reach its own host's public address
+    // (NAT hairpin) but CAN reach the host's published port via the
+    // container's default gateway. So for any host that isn't already an
+    // internal address, also try the gateway / host.docker.internal with
+    // the same port, user, password and dbname.
+    if (u && String(process.env.PG_NO_HOST_FALLBACK || '') !== '1') {
       const alts = [];
       const gw = dockerGatewayIp(); if (gw) alts.push(gw);
       alts.push('host.docker.internal', '172.17.0.1');
@@ -561,10 +568,12 @@ const server = http.createServer((req, res) => {
   res.end(req.method === 'HEAD' ? undefined : page);
 });
 
+module.exports = { PgStore, SqliteStore, dockerGatewayIp, sanitizeUrl };
+
 /* Serve immediately; bring storage up in the background and retry until it
  * connects. Guests are unaffected while storage is down — the sync API
  * answers 503 storage_unavailable until it is ready. */
-(async () => {
+if (require.main === module) (async () => {
   const usePg = HAS_PG_VARS;
   store = usePg ? new PgStore(DATABASE_URL) : new SqliteStore(DATA_DIR);
   server.listen(PORT, () => console.log('Daily Habit listening on port ' + PORT + ' [storage: ' + store.kind + ', initializing]'));
