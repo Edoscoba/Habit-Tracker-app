@@ -30,6 +30,24 @@ No `DATABASE_URL`? The app still runs and stores accounts in SQLite at
 `/app/data`; attach persistent storage there if your platform offers it, or
 accounts reset on redeploy.
 
+### If the app can't reach the database (Container Logs show timeouts)
+
+Single-host platforms sometimes advertise a database on a public
+`host:port` that their own firewall blocks from inside app containers. The
+server keeps running for guests (sync API answers 503) and retries every
+15 s, trying in order: the string as given → the container's host gateway →
+internal container names. Two non-secret env vars steer it:
+
+- `DB_INSTANCE_NAME=<database instance name>` (e.g. `daily-habit-db`) — the
+  app resolves well-known container-name patterns on the internal Docker
+  network and connects on port 5432 (`DB_INTERNAL_PORT` to change).
+- `DB_HOST_OVERRIDE=<host[:port]>` — force a specific internal host, keeping
+  the user, password and database from `DATABASE_URL`.
+
+Each attempt is logged with credentials redacted, so the logs tell you which
+route worked. `PGSSL=require|disable` forces TLS on/off; `PG_NO_HOST_FALLBACK=1`
+disables the gateway attempts.
+
 Health check: `GET /healthz` → `200 ok`. The server listens on `$PORT`
 (default 3000).
 

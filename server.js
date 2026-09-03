@@ -167,27 +167,62 @@ class SqliteStore {
   }
 }
 
+/* ---- internal-hostname candidates (single-host docker PaaS) ----
+ * Some platforms advertise a managed DB on a public host:port that their
+ * own firewall blocks from inside containers, while the DB container sits
+ * on a shared private docker network where its NAME resolves via docker's
+ * embedded DNS. Given the database instance name (DB_INSTANCE_NAME, or the
+ * platform's naming conventions), we try a few well-known name patterns on
+ * the standard port — plain DNS lookups of specific names, no scanning. */
+const dns = require('dns').promises;
+
+function internalNameCandidates(instanceName){
+  const n = String(instanceName || '').trim().toLowerCase();
+  if (!n) return [];
+  const names = [n, 'gs-' + n, 'db-' + n, n + '-db', 'gs-db-' + n, n + '-postgres', 'postgres-' + n, 'pg-' + n];
+  return [...new Set(names)];
+}
+async function resolvable(name){
+  try { const a = await dns.lookup(name, { family: 4 }); return a && a.address ? a.address : null; }
+  catch (e) { return null; }
+}
+
 class PgStore {
   constructor(url){ this.url = url; this.kind = 'postgres'; }
 
-  /* Build connection candidates. Managed single-host platforms often hand
-   * out a "localhost" connection string that is only valid on the host —
-   * from inside the app container the host is the docker gateway. Try the
-   * string as given, then gateway/host aliases, each without and with TLS. */
-  buildCandidates(){
+  sslOrder(){
     const url = this.url;
     const sslEnv = String(process.env.PGSSL || '').toLowerCase();
     const forceSsl = /sslmode=(require|verify|prefer)/i.test(url) || ['1', 'true', 'require', 'yes', 'on'].includes(sslEnv);
     const noSsl = ['0', 'false', 'no', 'off', 'disable'].includes(sslEnv) || /sslmode=disable/i.test(url);
-    const sslOrder = noSsl ? [false] : (forceSsl ? [true, false] : [false, true]);
-    const mk = (theUrl, ssl) => ({
+    return noSsl ? [false] : (forceSsl ? [true, false] : [false, true]);
+  }
+  mk(theUrl, ssl, note){
+    return {
       config: ssl ? { connectionString: theUrl, ssl: { rejectUnauthorized: false } } : { connectionString: theUrl },
-      label: sanitizeUrl(theUrl) + (ssl ? ' +tls' : ' no-tls')
-    });
+      label: sanitizeUrl(theUrl) + (ssl ? ' +tls' : ' no-tls') + (note ? ' (' + note + ')' : '')
+    };
+  }
+  withHost(hostPort){
+    const v = new URL(this.url);
+    const m = String(hostPort).match(/^\[?([^\]:]+)\]?(?::(\d+))?$/);
+    if (!m) return null;
+    v.hostname = m[1]; if (m[2]) v.port = m[2];
+    return v.toString();
+  }
+
+  /* Static candidates: optional DB_HOST_OVERRIDE first, then the string as
+   * given, then gateway/host aliases on the same port (with/without TLS). */
+  buildCandidates(){
+    const url = this.url;
+    const sslOrder = this.sslOrder();
+    const mk = (theUrl, ssl, note) => this.mk(theUrl, ssl, note);
     if (!url) return sslOrder.map(ssl => ({ config: ssl ? { ssl: { rejectUnauthorized: false } } : {}, label: 'PG* env vars' + (ssl ? ' +tls' : ' no-tls') }));
     const out = [];
-    for (const ssl of sslOrder) out.push(mk(url, ssl));
     let u = null; try { u = new URL(url); } catch (e) {}
+    const override = String(process.env.DB_HOST_OVERRIDE || '').trim();
+    if (u && override) { const ov = this.withHost(override); if (ov) for (const ssl of sslOrder) out.push(mk(ov, ssl, 'DB_HOST_OVERRIDE')); }
+    for (const ssl of sslOrder) out.push(mk(url, ssl));
     const host = u ? u.hostname : '';
     // Managed DBs on single-host platforms (GuildServer) are published on
     // the HOST — often advertised via the platform's public domain or
@@ -209,25 +244,50 @@ class PgStore {
     return out;
   }
 
+  async tryCandidate(Pool, cand){
+    const pool = new Pool(Object.assign({}, cand.config, { max: 8, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 }));
+    try {
+      const probe = await pool.connect();
+      try { await probe.query('SELECT 1'); } finally { probe.release(); }
+      this.pool = pool;
+      pool.on('error', (e) => { console.error('Postgres pool error: ' + errDetail(e)); markStorageDown(); });
+      console.log('Postgres connected via ' + cand.label);
+      await this.ensureSchema();
+      return true;
+    } catch (e) {
+      console.error('Postgres candidate failed — ' + cand.label + ': ' + errDetail(e));
+      await pool.end().catch(() => {});
+      this.lastErr = e;
+      return false;
+    }
+  }
+
+  /* Internal-name candidates: resolve well-known container-name patterns for
+   * the database instance via docker DNS; only names that resolve are tried. */
+  async discoveryCandidates(){
+    try { new URL(this.url); } catch (e) { return []; }
+    const inst = String(process.env.DB_INSTANCE_NAME || '').trim();
+    const names = internalNameCandidates(inst);
+    if (!names.length) { console.error('Internal lookup skipped — set DB_INSTANCE_NAME=<database instance name> to try docker-network hostnames.'); return []; }
+    const port = Number(process.env.DB_INTERNAL_PORT) || 5432;
+    const out = [];
+    for (const name of names) {
+      const ip = await resolvable(name);
+      if (!ip) continue;
+      console.error('Internal lookup: ' + name + ' resolves to ' + ip + ' → will try on port ' + port);
+      const theUrl = this.withHost(name + ':' + port);
+      for (const ssl of this.sslOrder()) out.push(this.mk(theUrl, ssl, 'internal name'));
+    }
+    if (!out.length) console.error('Internal lookup: none of [' + names.join(', ') + '] resolve on this network.');
+    return out;
+  }
+
   async init(){
     const { Pool } = require('pg');
-    let lastErr = null;
-    for (const cand of this.buildCandidates()) {
-      const pool = new Pool(Object.assign({}, cand.config, { max: 8, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 }));
-      try {
-        const probe = await pool.connect();
-        try { await probe.query('SELECT 1'); } finally { probe.release(); }
-        this.pool = pool;
-        console.log('Postgres connected via ' + cand.label);
-        await this.ensureSchema();
-        return;
-      } catch (e) {
-        lastErr = e;
-        console.error('Postgres candidate failed — ' + cand.label + ': ' + errDetail(e));
-        await pool.end().catch(() => {});
-      }
-    }
-    throw lastErr || new Error('no postgres connection candidates');
+    this.lastErr = null;
+    for (const cand of this.buildCandidates()) if (await this.tryCandidate(Pool, cand)) return;
+    for (const cand of await this.discoveryCandidates()) if (await this.tryCandidate(Pool, cand)) return;
+    throw this.lastErr || new Error('no postgres connection candidates');
   }
 
   async ensureSchema(){
@@ -558,7 +618,11 @@ const server = http.createServer((req, res) => {
 
   if (pathname.startsWith('/api/')) {
     handleApi(req, res, pathname).catch((e) => {
-      if (!res.headersSent) send(res, e && e.code === 413 ? 413 : (e && e.code === 400 ? 400 : 500), { error: e && e.code ? e.message : 'server_error' });
+      if (storageReady && store && store.kind === 'postgres' && isConnError(e)) markStorageDown();
+      if (!res.headersSent) {
+        if (isConnError(e)) return send(res, 503, { error: 'storage_unavailable' });
+        send(res, e && e.code === 413 ? 413 : (e && e.code === 400 ? 400 : 500), { error: e && e.code ? e.message : 'server_error' });
+      }
     });
     return;
   }
@@ -568,27 +632,48 @@ const server = http.createServer((req, res) => {
   res.end(req.method === 'HEAD' ? undefined : page);
 });
 
-module.exports = { PgStore, SqliteStore, dockerGatewayIp, sanitizeUrl };
+module.exports = { PgStore, SqliteStore, dockerGatewayIp, sanitizeUrl, internalNameCandidates };
 
-/* Serve immediately; bring storage up in the background and retry until it
- * connects. Guests are unaffected while storage is down — the sync API
- * answers 503 storage_unavailable until it is ready. */
-if (require.main === module) (async () => {
+/* Storage lifecycle: serve immediately; bring storage up in the background
+ * and retry until it connects. Guests are unaffected while storage is down —
+ * the sync API answers 503 storage_unavailable until it is ready. If the
+ * connection is lost later (DB moved/restarted), rediscover and reconnect. */
+let bringingUp = false;
+const CONN_ERR_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', '57P01', '57P02', '57P03', '08000', '08003', '08006']);
+function isConnError(e){
+  return !!(e && (CONN_ERR_CODES.has(e.code) || /terminated|timeout|ECONNREFUSED|not connected|Connection ended/i.test(String(e.message || ''))));
+}
+function markStorageDown(){
+  if (!storageReady && bringingUp) return;
+  storageReady = false;
+  console.error('Storage marked unavailable — reconnecting…');
+  bringUpStorage();
+}
+async function bringUpStorage(){
+  if (bringingUp) return;
+  bringingUp = true;
   const usePg = HAS_PG_VARS;
-  store = usePg ? new PgStore(DATABASE_URL) : new SqliteStore(DATA_DIR);
-  server.listen(PORT, () => console.log('Daily Habit listening on port ' + PORT + ' [storage: ' + store.kind + ', initializing]'));
-  for (;;) {
-    try {
-      await store.init();
-      storageReady = true;
-      console.log('Storage ready [storage: ' + store.kind + (usePg ? '' : ', ' + DATA_DIR) + ']');
-      return;
-    } catch (e) {
-      console.error('Storage init failed (' + store.kind + '): ' + errDetail(e));
-      console.error(usePg
-        ? 'Sync API disabled until the database is reachable (guests unaffected). Retrying in 15s — check DATABASE_URL and network/TLS.'
-        : 'Sync API disabled until storage works (guests unaffected). Retrying in 15s — check that DATA_DIR is writable.');
-      await new Promise(r => setTimeout(r, 15000));
+  try {
+    for (;;) {
+      try {
+        if (store.pool) { try { await store.pool.end(); } catch (e) {} store.pool = null; }
+        await store.init();
+        storageReady = true;
+        console.log('Storage ready [storage: ' + store.kind + (usePg ? '' : ', ' + DATA_DIR) + ']');
+        return;
+      } catch (e) {
+        console.error('Storage init failed (' + store.kind + '): ' + errDetail(e));
+        console.error(usePg
+          ? 'Sync API disabled until the database is reachable (guests unaffected). Retrying in 15s — check DATABASE_URL / DB_HOST_OVERRIDE and the discovery lines above.'
+          : 'Sync API disabled until storage works (guests unaffected). Retrying in 15s — check that DATA_DIR is writable.');
+        await new Promise(r => setTimeout(r, 15000));
+      }
     }
-  }
-})();
+  } finally { bringingUp = false; }
+}
+
+if (require.main === module) {
+  store = HAS_PG_VARS ? new PgStore(DATABASE_URL) : new SqliteStore(DATA_DIR);
+  server.listen(PORT, () => console.log('Daily Habit listening on port ' + PORT + ' [storage: ' + store.kind + ', initializing]'));
+  bringUpStorage();
+}
