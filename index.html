@@ -8,6 +8,7 @@
 <meta name="theme-color" content="#171310" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ctext%20y%3D%2282%22%20font-size%3D%2282%22%3E%F0%9F%94%A5%3C%2Ftext%3E%3C%2Fsvg%3E">
 <style>body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<script>window.DH_WEB=true</script>
 <title>Daily Habit</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito+Sans:opsz,wght@6..12,400;6..12,600;6..12,700;6..12,800&display=swap">
 <style>
@@ -108,6 +109,18 @@
     position: absolute; inset: 0; display: grid; place-items: center;
     font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 13px;
   }
+  .top-right { display: flex; align-items: center; gap: 10px; flex: none; }
+  .acct-btn {
+    width: 40px; height: 40px; border-radius: 50%; border: 2px solid var(--line);
+    background: var(--card); font-size: 17px; display: grid; place-items: center;
+    transition: transform .12s ease, border-color .12s ease; padding: 0;
+  }
+  .acct-btn:hover { border-color: var(--faint); }
+  .acct-btn:active { transform: scale(.94); }
+  .acct-btn.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-deep);
+    font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 16px; }
+  .auth-err { color: var(--bad); font-size: 12.5px; font-weight: 700; min-height: 18px; margin-top: 8px; }
+  .auth-hint { color: var(--faint); font-size: 11.5px; font-weight: 600; margin-top: 6px; }
 
   /* ---------- sections ---------- */
   .sec-title {
@@ -370,13 +383,16 @@
       <div class="wordmark">Daily <span class="hi">Habit</span></div>
       <div class="today-date" id="today-date"></div>
     </div>
-    <div class="ringbox" id="ringbox" title="Checked in today">
-      <svg viewBox="0 0 52 52" aria-hidden="true">
-        <circle class="ring-track" cx="26" cy="26" r="22" fill="none" stroke-width="5"></circle>
-        <circle class="ring-fill" id="ring-fill" cx="26" cy="26" r="22" fill="none" stroke-width="5"
-                stroke-linecap="round" stroke-dasharray="138.2" stroke-dashoffset="138.2"></circle>
-      </svg>
-      <div class="ring-label" id="ring-label">0/0</div>
+    <div class="top-right">
+      <button class="acct-btn" id="acct-btn" hidden aria-label="Sign in to sync"><span id="acct-glyph">👤</span></button>
+      <div class="ringbox" id="ringbox" title="Checked in today">
+        <svg viewBox="0 0 52 52" aria-hidden="true">
+          <circle class="ring-track" cx="26" cy="26" r="22" fill="none" stroke-width="5"></circle>
+          <circle class="ring-fill" id="ring-fill" cx="26" cy="26" r="22" fill="none" stroke-width="5"
+                  stroke-linecap="round" stroke-dasharray="138.2" stroke-dashoffset="138.2"></circle>
+        </svg>
+        <div class="ring-label" id="ring-label">0/0</div>
+      </div>
     </div>
   </header>
 
@@ -455,6 +471,37 @@
   </div>
 </div>
 
+<div class="overlay" id="auth-overlay" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+    <h3 id="auth-title">Sync across devices</h3>
+    <p class="sheet-sub">Free account — your habits follow you to any phone or computer.</p>
+    <div id="auth-form">
+      <div class="seg" id="auth-mode-seg">
+        <button class="seg-btn on" data-amode="reg">Create account</button>
+        <button class="seg-btn" data-amode="log">Sign in</button>
+      </div>
+      <div class="f-label">Email</div>
+      <input class="f-input" id="auth-email" type="email" autocomplete="email" placeholder="you@example.com" maxlength="255">
+      <div class="f-label">Password</div>
+      <input class="f-input" id="auth-pass" type="password" autocomplete="new-password" placeholder="••••••••" maxlength="200">
+      <div class="auth-hint" id="auth-hint">At least 8 characters. There's no password reset yet — pick one you'll remember.</div>
+      <div class="auth-err" id="auth-err" role="alert"></div>
+      <div class="sheet-actions">
+        <button class="btn-ghost" id="auth-cancel">Cancel</button>
+        <button class="btn-main" id="auth-submit">Create account</button>
+      </div>
+    </div>
+    <div id="auth-signed" hidden>
+      <p style="font-weight:800;margin:6px 0 4px" id="auth-who"></p>
+      <p class="sheet-sub">Every check-in on this device syncs to your account automatically.</p>
+      <div class="sheet-actions">
+        <button class="btn-ghost" id="auth-close">Close</button>
+        <button class="btn-main" id="auth-logout">Sign out</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast" role="status"></div>
 <div class="tooltip" id="tooltip"></div>
 <canvas id="fx"></canvas>
@@ -487,6 +534,14 @@ const STARTERS = [
 ];
 
 /* ================= state ================= */
+const WEB = !!window.DH_WEB;   // set by the self-hosted build; absent in the claude.ai artifact
+async function api(pathname, opts){
+  const o = Object.assign({ credentials: 'same-origin' }, opts || {});
+  o.headers = Object.assign({ 'Content-Type': 'application/json', 'x-dh': '1' }, o.headers || {});
+  const r = await fetch(pathname, o);
+  let body = null; try { body = await r.json(); } catch (e) {}
+  return { ok: r.ok, status: r.status, body };
+}
 let today = todayStr();
 const state = { habits: {}, logs: {}, notes: {} };   // habits[id], logs[id].days[date]='y'|'n', notes[date]=text
 let loaded = false;
@@ -574,13 +629,42 @@ function weeklySeries(habit){
 /* ================= storage ================= */
 const KEY = 'daily-habit-v1';
 const store = {
-  mode: 'loading', db: null, warned: false,
+  mode: 'loading', db: null, warned: false, account: null,
 
   async init(){
+    if (WEB) {
+      try {
+        const me = await api('/api/me');
+        if (me.ok && me.body && me.body.email) return this.enterApi(me.body.email);
+      } catch (e) {}
+      this.mode = this.localUsable() ? 'local' : 'memory';
+      this.loadLocal(); loaded = true; render();
+      return;
+    }
     let ns = null;
     try { if (window.claude && window.claude.use) ns = await window.claude.use('db'); } catch (e) { ns = null; }
     if (ns) { this.db = ns; this.mode = 'db'; this.subscribe(); }
     else { this.mode = this.localUsable() ? 'local' : 'memory'; this.loadLocal(); loaded = true; render(); }
+  },
+
+  async enterApi(email){
+    this.mode = 'api'; this.account = { email };
+    try {
+      const d = await api('/api/data');
+      if (d.ok && d.body) { state.habits = d.body.habits || {}; state.logs = d.body.logs || {}; state.notes = d.body.notes || {}; }
+      else toast("Couldn't load your synced data — check your connection");
+    } catch (e) { toast("Couldn't load your synced data — check your connection"); }
+    loaded = true; selectedId = null; render();
+  },
+
+  sync(p){
+    p.then(r => { if (!r.ok) this.apiErr(r); })
+     .catch(() => toast("Couldn't sync — check your connection"));
+  },
+  apiErr(r){
+    if (r.status === 401) toast('Signed out elsewhere — sign in again to keep syncing');
+    else if (r.body && r.body.error === 'habit_limit') toast('Habit limit reached (50) — remove one first');
+    else toast("Couldn't sync that change — it may not be saved");
   },
 
   localUsable(){ try { localStorage.setItem('__dh_t', '1'); localStorage.removeItem('__dh_t'); return true; } catch (e) { return false; } },
@@ -639,6 +723,8 @@ const store = {
           try { await ref.set({ days: Object.assign({}, log.days) }); } catch (e2) { this.err(e2); }
         } else this.err(e);
       }
+    } else if (this.mode === 'api') {
+      this.sync(api('/api/day', { method: 'PATCH', body: JSON.stringify({ habitId: id, date, val }) }));
     } else this.saveLocal();
   },
 
@@ -653,6 +739,8 @@ const store = {
           try { await ref.set({ days: Object.assign({}, state.notes) }); } catch (e2) { this.err(e2); }
         } else this.err(e);
       }
+    } else if (this.mode === 'api') {
+      this.sync(api('/api/note', { method: 'PATCH', body: JSON.stringify({ date, text }) }));
     } else this.saveLocal();
   },
 
@@ -664,6 +752,8 @@ const store = {
     if (this.mode === 'db') {
       try { await this.db.doc('habits/' + id).set(h); await this.db.doc('logs/' + id).set({ days: {} }); }
       catch (e) { this.err(e); }
+    } else if (this.mode === 'api') {
+      this.sync(api('/api/habits/' + id, { method: 'PUT', body: JSON.stringify(h) }));
     } else this.saveLocal();
     return id;
   },
@@ -680,6 +770,8 @@ const store = {
           try { await ref.set(Object.assign({}, state.habits[id])); } catch (e2) { this.err(e2); }
         } else this.err(e);
       }
+    } else if (this.mode === 'api') {
+      this.sync(api('/api/habits/' + id, { method: 'PUT', body: JSON.stringify(Object.assign({}, state.habits[id])) }));
     } else this.saveLocal();
   },
 
@@ -690,6 +782,8 @@ const store = {
     if (this.mode === 'db') {
       try { await this.db.doc('habits/' + id).delete(); await this.db.doc('logs/' + id).delete(); }
       catch (e) { this.err(e); }
+    } else if (this.mode === 'api') {
+      this.sync(api('/api/habits/' + id, { method: 'DELETE' }));
     } else this.saveLocal();
   }
 };
@@ -746,6 +840,15 @@ function renderRecap(){
 
 function renderHeader(){
   $('today-date').textContent = fmtHuman(today);
+  const ab = $('acct-btn');
+  ab.hidden = !WEB;
+  if (WEB) {
+    const on = store.mode === 'api';
+    ab.classList.toggle('on', on);
+    $('acct-glyph').textContent = (on && store.account && store.account.email) ? store.account.email[0].toUpperCase() : '👤';
+    ab.setAttribute('aria-label', on ? 'Account — signed in and syncing' : 'Sign in to sync');
+    ab.title = on ? 'Signed in — syncing' : 'Sign in to sync';
+  }
   const p = todayProgress();
   const frac = p.total > 0 ? p.handled / p.total : 0;
   $('ring-fill').style.strokeDashoffset = (138.2 * (1 - frac)).toFixed(1);
@@ -932,7 +1035,9 @@ function renderChart(h){
 
 function renderFootnote(){
   const el = $('save-note');
-  if (store.mode === 'db') el.textContent = 'Check-ins save to this page automatically — open it any day, on any device.';
+  if (store.mode === 'api') el.textContent = 'Synced to your account — your habits follow you on any device.';
+  else if (store.mode === 'local' && WEB) el.textContent = 'Saved in this browser — sign in (top right) to sync across devices.';
+  else if (store.mode === 'db') el.textContent = 'Check-ins save to this page automatically — open it any day, on any device.';
   else if (store.mode === 'local') el.textContent = 'Saved in this browser.';
   else if (store.mode === 'memory') el.textContent = 'Preview mode — changes won’t be saved.';
   else el.textContent = '';
@@ -1114,6 +1219,74 @@ async function saveDay(){
   if (editingVal === 'y' && date === today) celebrate(id);
 }
 
+/* ---------- account / sync dialog ---------- */
+let authMode = 'reg';
+function openAuth(){
+  const signed = store.mode === 'api';
+  $('auth-form').hidden = signed;
+  $('auth-signed').hidden = !signed;
+  $('auth-title').textContent = signed ? 'Account' : 'Sync across devices';
+  if (signed) $('auth-who').textContent = '✓ Signed in as ' + (store.account ? store.account.email : '');
+  else { $('auth-err').textContent = ''; paintAuthMode(); }
+  $('auth-overlay').hidden = false;
+  if (!signed) setTimeout(() => $('auth-email').focus(), 60);
+}
+function paintAuthMode(){
+  document.querySelectorAll('#auth-mode-seg .seg-btn').forEach(b => b.classList.toggle('on', b.dataset.amode === authMode));
+  $('auth-submit').textContent = authMode === 'reg' ? 'Create account' : 'Sign in';
+  $('auth-pass').setAttribute('autocomplete', authMode === 'reg' ? 'new-password' : 'current-password');
+  $('auth-hint').hidden = authMode !== 'reg';
+}
+async function submitAuth(){
+  const email = $('auth-email').value.trim(), pass = $('auth-pass').value;
+  const err = $('auth-err'); err.textContent = '';
+  if (!email || email.indexOf('@') < 1) { err.textContent = 'Enter a valid email address.'; return; }
+  if (pass.length < 8) { err.textContent = 'Password needs at least 8 characters.'; return; }
+  $('auth-submit').disabled = true;
+  let r;
+  try { r = await api(authMode === 'reg' ? '/api/register' : '/api/login', { method: 'POST', body: JSON.stringify({ email, password: pass }) }); }
+  catch (e) { r = { ok: false, status: 0 }; }
+  $('auth-submit').disabled = false;
+  if (!r.ok) {
+    err.textContent =
+      r.status === 409 ? 'That email already has an account — switch to Sign in.' :
+      r.status === 401 ? 'Wrong email or password.' :
+      r.status === 429 ? 'Too many attempts — wait a few minutes and try again.' :
+      r.status === 400 ? 'Check the email and password and try again.' :
+      "Couldn't reach the server — try again.";
+    return;
+  }
+  $('auth-overlay').hidden = true;
+  $('auth-pass').value = '';
+  await onSignedIn(r.body && r.body.email ? r.body.email : email);
+}
+async function onSignedIn(email){
+  const guest = { habits: state.habits, logs: state.logs, notes: state.notes };
+  const hadGuestData = (store.mode === 'local' || store.mode === 'memory') && Object.keys(guest.habits).length > 0;
+  let imported = false;
+  try {
+    const d = await api('/api/data');
+    const serverEmpty = d.ok && d.body && Object.keys(d.body.habits || {}).length === 0;
+    if (serverEmpty && hadGuestData) {
+      const im = await api('/api/import', { method: 'POST', body: JSON.stringify(guest) });
+      imported = im.ok;
+    }
+  } catch (e) {}
+  await store.enterApi(email);
+  toast(imported ? 'Signed in — this device’s habits are now in your account ✓' : 'Signed in — your habits sync across devices ✓');
+}
+async function doLogout(){
+  try { await api('/api/logout', { method: 'POST' }); } catch (e) {}
+  store.account = null;
+  store.mode = store.localUsable() ? 'local' : 'memory';
+  state.habits = {}; state.logs = {}; state.notes = {};
+  store.loadLocal();
+  selectedId = null;
+  $('auth-overlay').hidden = true;
+  render();
+  toast('Signed out — this device is back to browser-only data');
+}
+
 /* ================= events ================= */
 let delArmed = false, delTimer = null;
 
@@ -1200,11 +1373,22 @@ function bindEvents(){
   $('day-save').addEventListener('click', saveDay);
   $('day-cancel').addEventListener('click', () => { $('day-overlay').hidden = true; });
 
+  /* account dialog */
+  $('acct-btn').addEventListener('click', openAuth);
+  $('auth-mode-seg').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-amode]'); if (b) { authMode = b.dataset.amode; $('auth-err').textContent = ''; paintAuthMode(); }
+  });
+  $('auth-submit').addEventListener('click', submitAuth);
+  $('auth-cancel').addEventListener('click', () => { $('auth-overlay').hidden = true; });
+  $('auth-close').addEventListener('click', () => { $('auth-overlay').hidden = true; });
+  $('auth-logout').addEventListener('click', doLogout);
+  $('auth-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
+
   document.querySelectorAll('.overlay').forEach(ov => {
     ov.addEventListener('mousedown', (e) => { if (e.target === ov) ov.hidden = true; });
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { $('add-overlay').hidden = true; $('day-overlay').hidden = true; }
+    if (e.key === 'Escape') { $('add-overlay').hidden = true; $('day-overlay').hidden = true; $('auth-overlay').hidden = true; }
   });
 }
 

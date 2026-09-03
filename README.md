@@ -1,40 +1,53 @@
-# Daily Habit — deployment package
+# Daily Habit — with accounts & cross-device sync
 
-A self-contained habit/streak tracker: one HTML file plus a tiny Node server.
-No dependencies, no build step, no database required.
+A habit/streak tracker: one HTML file plus a single Node server file.
+Works instantly for guests (data in their own browser), and visitors can
+optionally **create an account to sync habits across devices**.
+No npm dependencies — the database is SQLite via Node's built-in driver.
 
 ## Deploy on GuildServer (guild-technologies.com)
 
-Option A — GitHub deploy (recommended):
-1. Push this folder to a GitHub repository (files at the repo root).
-2. In GuildServer, create a new app from that repository and pick the Node runtime.
-3. Start command: `npm start` (the server honors the `PORT` environment variable).
-4. Attach your domain (e.g. habits.guild-technologies.com) and GuildServer's TLS takes care of HTTPS.
+1. Deploy this repo as before (Dockerfile route, or Node runtime with `npm start`).
+   The server listens on `$PORT` (defaults to 3000). Health check: `GET /healthz`.
+2. **IMPORTANT — attach persistent storage at `/app/data`.**
+   Account data lives in a SQLite file inside `/app/data`. If the app's settings
+   offer a volume / persistent storage / mount option, point it at `/app/data`.
+   Without it, accounts and synced data reset on every redeploy.
+   (Guest/browser-only usage is unaffected either way.)
+   You can also set the `DATA_DIR` env var to move the database elsewhere.
+3. Redeploy. Done — the app now shows a "Sign in to sync" account button.
 
-Option B — Docker:
-The included `Dockerfile` builds a ~50 MB image that serves the app on `$PORT`
-(defaults to 3000). Use it as-is with GuildServer's container deploy, or let
-GuildServer auto-generate its own — either works.
+## How accounts work
 
-Health check endpoint: `GET /healthz` → `200 ok`.
+- Optional: guests use the app with data stored in their browser, no sign-up.
+- "Create account" = email + password (min 8 chars). Passwords are stored as
+  scrypt hashes; sessions are HttpOnly cookies (120 days, sliding).
+- On first sign-in from a browser that has guest data, that data is imported
+  into the account automatically.
+- Signing out returns the browser to its guest data. Account data stays on the
+  server for the next sign-in, from any device.
+- Rate limiting protects the login/registration endpoints.
+- **Not included yet:** password reset by email (needs an email service) and
+  email verification. Choose a password you'll remember.
 
-## Where the data lives
+## API (used by the app itself)
 
-This copy stores each visitor's habits and check-ins in **their own browser**
-(localStorage). That means:
-- It works instantly for any visitor, with no accounts and no server database.
-- Data does not sync between devices or browsers, and clearing site data erases it.
-- It is completely separate from the claude.ai copy of the app — check-ins made
-  here are not seen by the claude.ai version or its 8 PM reminder.
-
-If you later want accounts and cross-device sync on your own server, the app
-needs a small backend API and a database (GuildServer supports both) — the
-storage layer in `index.html` is already an adapter, so it can be pointed at an
-API without rewriting the app.
+`POST /api/register` · `POST /api/login` · `POST /api/logout` · `GET /api/me`
+`GET /api/data` · `POST /api/import`
+`PUT/DELETE /api/habits/:id` · `PATCH /api/day` · `PATCH /api/note`
+All JSON; mutating calls require the `x-dh: 1` header (CSRF belt-and-braces on
+top of SameSite=Lax cookies).
 
 ## Files
 
-- `index.html` — the entire app (UI + logic, works on any static host)
-- `server.js` — zero-dependency static server, `PORT`-aware
-- `package.json` — `npm start` runs the server
-- `Dockerfile` — optional container route
+- `index.html` — the entire app UI (also runs standalone on any static host)
+- `server.js` — static serving + auth + sync API + SQLite storage (no deps)
+- `package.json` — `npm start` runs the server (Node ≥ 22)
+- `Dockerfile` — container route (node:24-alpine), data at `/app/data`
+
+## Run locally
+
+```
+node server.js
+# → http://localhost:3000  (database appears in ./data/)
+```

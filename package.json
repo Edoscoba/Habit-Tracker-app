@@ -1,13 +1,13 @@
 {
   "name": "daily-habit",
-  "version": "1.0.0",
-  "description": "Daily Habit — streak tracker for good and bad habits",
+  "version": "2.0.0",
+  "description": "Daily Habit — streak tracker with optional accounts and cross-device sync",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "license": "UNLICENSED",
   "private": true
