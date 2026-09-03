@@ -51,6 +51,31 @@ disables the gateway attempts.
 Health check: `GET /healthz` → `200 ok`. The server listens on `$PORT`
 (default 3000).
 
+## Reminders & habit windows (push notifications)
+
+Each habit can have a **daily reminder hour**, and good habits can have a
+**window** (e.g. 7:00–8:00). Signed-in users who enable notifications on a
+device (account button → *Notifications on this device* → Enable) get:
+
+- a reminder at the reminder hour,
+- "Time for …" when a window opens and "… window ended — did you do it?" when
+  it closes — both skipped automatically once the habit is checked in for the day.
+
+Times are whole hours in the **device's** time zone (each device records its
+zone when it enables notifications). Notifications are real Web Push: they
+arrive with the site closed. On iPhone/iPad the site must first be added to
+the Home Screen (Share → Add to Home Screen) and opened from there — the app
+ships a manifest and icons so it installs cleanly.
+
+Server side: VAPID keys are generated once and stored in the database (or
+set `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY`); set `VAPID_SUBJECT` to your
+site URL or a `mailto:` address. A ticker runs every 30 s and sends at most
+one notification per device, habit and kind per hour; expired subscriptions
+are pruned automatically. Endpoints: `GET /api/push/vapid`,
+`POST /api/push/subscribe|unsubscribe|test`, `GET /api/push/status`;
+assets: `/sw.js`, `/manifest.webmanifest`, `/icon-192.png`, `/icon-512.png`,
+`/apple-touch-icon.png`.
+
 ## How accounts work
 
 - Optional: guests use the app with data stored in their browser, no sign-up.
@@ -75,7 +100,7 @@ All JSON; mutating calls require the `x-dh: 1` header.
 
 - `index.html` — the entire app UI (also runs standalone on any static host)
 - `server.js` — static serving + auth + sync API + storage (SQLite or Postgres)
-- `package.json` / `package-lock.json` — one dependency, `pg`; `npm start` runs it
+- `package.json` / `package-lock.json` — dependencies `pg` and `web-push`; `npm start` runs it
 - `Dockerfile` — container route (node:24-alpine, `npm ci`)
 
 ## Run locally

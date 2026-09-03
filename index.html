@@ -7,6 +7,12 @@
 <meta name="theme-color" content="#FFF8ED" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#171310" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ctext%20y%3D%2282%22%20font-size%3D%2282%22%3E%F0%9F%94%A5%3C%2Ftext%3E%3C%2Fsvg%3E">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Daily Habit">
 <style>body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
 <script>window.DH_WEB=true</script>
 <title>Daily Habit</title>
@@ -121,6 +127,26 @@
     font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 16px; }
   .auth-err { color: var(--bad); font-size: 12.5px; font-weight: 700; min-height: 18px; margin-top: 8px; }
   .auth-hint { color: var(--faint); font-size: 11.5px; font-weight: 600; margin-top: 6px; }
+
+  /* ---------- schedule (reminders & windows) ---------- */
+  .f-opt { text-transform: none; letter-spacing: 0; color: var(--faint); }
+  .sched-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; font-weight: 700; font-size: 13.5px; }
+  .sched-row + .sched-row { border-top: 1px solid var(--line); }
+  .sched-pair { display: inline-flex; align-items: center; gap: 6px; }
+  .sched-to { color: var(--faint); font-size: 12px; font-weight: 700; }
+  .f-select {
+    border: 2px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 11px;
+    padding: 7px 9px; font-weight: 700; font-size: 13.5px; min-width: 84px;
+  }
+  .f-select:focus { border-color: var(--accent); outline: none; }
+  .sched-badge {
+    display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 1px 8px;
+    font-size: 11.5px; font-weight: 800; background: var(--card2); color: var(--sub); font-variant-numeric: tabular-nums;
+  }
+  .sched-badge.live { background: color-mix(in srgb, var(--accent) 16%, var(--card)); color: var(--accent-deep); }
+  .sched-badge.passed { color: var(--faint); text-decoration: line-through; text-decoration-thickness: 1.5px; }
+  .push-status { font-weight: 800; font-size: 13.5px; margin: 4px 0 8px; }
+  .push-status.on { color: var(--good-text); }
 
   /* ---------- sections ---------- */
   .sec-title {
@@ -434,6 +460,17 @@
     <div class="emoji-grid" id="emoji-grid"></div>
     <div class="f-label">Color</div>
     <div class="color-row" id="color-row"></div>
+    <div class="f-label">Reminders <span class="f-opt">(optional)</span></div>
+    <div class="sched">
+      <label class="sched-row"><span>Daily reminder</span><select class="f-select" id="sched-remind" aria-label="Daily reminder hour"></select></label>
+      <div id="sched-window">
+        <label class="sched-row"><span>Habit window</span>
+          <span class="sched-pair"><select class="f-select" id="sched-start" aria-label="Window start hour"></select><span class="sched-to">to</span><select class="f-select" id="sched-end" aria-label="Window end hour"></select></span>
+        </label>
+        <div class="auth-hint">You'll be notified when the window opens and when it ends — unless you've already checked in.</div>
+      </div>
+      <div class="auth-hint" id="sched-hint"></div>
+    </div>
     <div id="edit-extras" hidden>
       <div class="f-label">Position in your list</div>
       <div class="seg">
@@ -494,6 +531,16 @@
     <div id="auth-signed" hidden>
       <p style="font-weight:800;margin:6px 0 4px" id="auth-who"></p>
       <p class="sheet-sub">Every check-in on this device syncs to your account automatically.</p>
+      <div id="push-block" hidden>
+        <div class="f-label">Notifications on this device</div>
+        <div class="push-status" id="push-status">Checking…</div>
+        <div class="seg" id="push-actions">
+          <button class="seg-btn" id="push-enable">🔔 Enable</button>
+          <button class="seg-btn" id="push-test" hidden>Send a test</button>
+          <button class="seg-btn" id="push-disable" hidden>Turn off</button>
+        </div>
+        <div class="auth-hint" id="push-hint">Reminders and habit windows arrive here even when the app is closed.</div>
+      </div>
       <div class="sheet-actions">
         <button class="btn-ghost" id="auth-close">Close</button>
         <button class="btn-main" id="auth-logout">Sign out</button>
@@ -903,12 +950,37 @@ function renderToday(){
         '<div class="habit-name">' + esc(h.name) + '</div>' +
         '<div class="habit-meta"><span>' + (h.type === 'good' ? '🌱 build' : '🚫 quit') + '</span>' +
           '<span class="streak-pill">🔥 ' + st.current + '</span>' +
-          (st.best > 0 ? '<span>best ' + st.best + '</span>' : '') + '</div>' +
+          (st.best > 0 ? '<span>best ' + st.best + '</span>' : '') +
+          scheduleBadge(h, v) + '</div>' +
       '</div>' +
       '<div class="row-actions">' + actions + '</div>' +
     '</div>';
   }).join('') + '</div>';
 }
+
+/* ---------- schedule helpers ---------- */
+const hr = (n) => Number.isInteger(n) && n >= 0 && n <= 23 ? n : null;
+const fmtH = (n) => n + ':00';
+function scheduleBadge(h, todayVal){
+  const ws = hr(h.winStart), we = hr(h.winEnd), ra = hr(h.remindAt);
+  const nowH = new Date().getHours();
+  const done = todayVal === 'y';
+  let out = '';
+  if (h.type === 'good' && ws !== null && we !== null) {
+    let cls = '', label = '⏰ ' + fmtH(ws) + '–' + fmtH(we);
+    if (!done && nowH >= ws && nowH < we) { cls = ' live'; label = '⏰ now · until ' + fmtH(we); }
+    else if (!done && nowH >= we) { cls = ' passed'; }
+    out += '<span class="sched-badge' + cls + '" title="Habit window">' + label + '</span>';
+  }
+  if (ra !== null) out += '<span class="sched-badge" title="Daily reminder">🔔 ' + fmtH(ra) + '</span>';
+  return out;
+}
+function fillHourSelect(sel, value, offLabel){
+  let html = '<option value="">' + (offLabel || 'Off') + '</option>';
+  for (let i = 0; i < 24; i++) html += '<option value="' + i + '"' + (value === i ? ' selected' : '') + '>' + fmtH(i) + '</option>';
+  sel.innerHTML = html;
+}
+function readHour(sel){ const v = sel.value; return v === '' ? null : Number(v); }
 
 function renderDetail(){
   const list = habitList();
@@ -1125,10 +1197,12 @@ function nextFreeColor(){
 }
 function openAdd(prefill, editId){
   editHabitId = (editId && state.habits[editId]) ? editId : null;
+  let sched = { remindAt: null, winStart: null, winEnd: null };
   if (editHabitId) {
     const h = state.habits[editHabitId];
     addSel = { type: h.type === 'bad' ? 'bad' : 'good', emoji: h.emoji || '💪', color: col(h) };
     $('add-name').value = h.name || '';
+    sched = { remindAt: hr(h.remindAt), winStart: hr(h.winStart), winEnd: hr(h.winEnd) };
   } else {
     addSel = {
       type: (prefill && prefill.type) || 'good',
@@ -1137,6 +1211,12 @@ function openAdd(prefill, editId){
     };
     $('add-name').value = (prefill && prefill.name) || '';
   }
+  fillHourSelect($('sched-remind'), sched.remindAt);
+  fillHourSelect($('sched-start'), sched.winStart, 'Off');
+  fillHourSelect($('sched-end'), sched.winEnd, '—');
+  $('sched-hint').textContent = WEB
+    ? 'Notifications go to devices where you’ve enabled them (account button → Notifications). Times are in your device’s time zone.'
+    : 'Shown on your habit list here; device notifications are available in the web version of the app.';
   $('add-title').textContent = editHabitId ? 'Edit habit' : 'New habit';
   $('add-save').textContent = editHabitId ? 'Save changes' : 'Start streak';
   $('edit-extras').hidden = !editHabitId;
@@ -1172,6 +1252,7 @@ async function moveHabit(dir){
 }
 function paintAdd(){
   document.querySelectorAll('#type-seg .seg-btn').forEach(b => b.classList.toggle('on', b.dataset.type === addSel.type));
+  $('sched-window').hidden = addSel.type !== 'good';
   $('emoji-grid').innerHTML = EMOJIS.map(e =>
     '<button class="emoji-opt' + (e === addSel.emoji ? ' on' : '') + '" data-emoji="' + e + '" aria-label="Emoji ' + e + '">' + e + '</button>').join('');
   $('color-row').innerHTML = Array.from({ length: SLOTS }, (_, i) =>
@@ -1180,8 +1261,16 @@ function paintAdd(){
 async function saveAdd(){
   const name = $('add-name').value.trim();
   if (!name) { toast('Give your habit a name first'); $('add-name').focus(); return; }
+  const type = addSel.type === 'bad' ? 'bad' : 'good';
+  const remindAt = readHour($('sched-remind'));
+  let winStart = type === 'good' ? readHour($('sched-start')) : null;
+  let winEnd = type === 'good' ? readHour($('sched-end')) : null;
+  if (winStart !== null || winEnd !== null) {
+    if (winStart === null || winEnd === null) { toast('Set both the start and end of the habit window'); return; }
+    if (winEnd <= winStart) { toast('The window must end after it starts'); return; }
+  }
   $('add-overlay').hidden = true;
-  const fields = { name, type: addSel.type === 'bad' ? 'bad' : 'good', emoji: addSel.emoji, color: addSel.color };
+  const fields = { name, type, emoji: addSel.emoji, color: addSel.color, remindAt, winStart, winEnd };
   if (editHabitId) {
     await store.updateHabit(editHabitId, fields);
     toast('Habit updated ✓');
@@ -1226,8 +1315,8 @@ function openAuth(){
   $('auth-form').hidden = signed;
   $('auth-signed').hidden = !signed;
   $('auth-title').textContent = signed ? 'Account' : 'Sync across devices';
-  if (signed) $('auth-who').textContent = '✓ Signed in as ' + (store.account ? store.account.email : '');
-  else { $('auth-err').textContent = ''; paintAuthMode(); }
+  if (signed) { $('auth-who').textContent = '✓ Signed in as ' + (store.account ? store.account.email : ''); refreshPushUI(); }
+  else { $('auth-err').textContent = ''; paintAuthMode(); $('push-block').hidden = true; }
   $('auth-overlay').hidden = false;
   if (!signed) setTimeout(() => $('auth-email').focus(), 60);
 }
@@ -1286,6 +1375,79 @@ async function doLogout(){
   $('auth-overlay').hidden = true;
   render();
   toast('Signed out — this device is back to browser-only data');
+}
+
+/* ---------- device notifications (web build, signed in) ---------- */
+const pushSupported = () => WEB && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent);
+const isStandalone = () => (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+function b64ToU8(b64){
+  const s = (b64 + '='.repeat((4 - b64.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(s); const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+async function currentPushSub(){
+  try { const reg = await navigator.serviceWorker.getRegistration(); return reg ? await reg.pushManager.getSubscription() : null; } catch (e) { return null; }
+}
+async function refreshPushUI(){
+  const block = $('push-block');
+  if (!WEB || store.mode !== 'api') { block.hidden = true; return; }
+  block.hidden = false;
+  const status = $('push-status'), enable = $('push-enable'), test = $('push-test'), disable = $('push-disable'), hint = $('push-hint');
+  status.classList.remove('on');
+  if (!pushSupported()) {
+    status.textContent = 'Not available in this browser';
+    enable.hidden = true; test.hidden = true; disable.hidden = true;
+    hint.textContent = (isIOS() && !isStandalone())
+      ? 'On iPhone/iPad: add this site to your Home Screen (Share → Add to Home Screen), open it from there, then enable notifications.'
+      : 'Try a recent Chrome, Edge, Firefox or Safari.';
+    return;
+  }
+  if (Notification.permission === 'denied') {
+    status.textContent = 'Blocked — allow notifications for this site in your browser settings';
+    enable.hidden = true; test.hidden = true; disable.hidden = true; return;
+  }
+  const sub = await currentPushSub();
+  let devices = null;
+  try { const r = await api('/api/push/status'); if (r.ok) devices = r.body.devices; } catch (e) {}
+  if (sub) {
+    status.textContent = 'Enabled on this device ✓' + (devices > 1 ? ' · ' + devices + ' devices in total' : '');
+    status.classList.add('on'); enable.hidden = true; test.hidden = false; disable.hidden = false;
+  } else {
+    status.textContent = 'Off on this device' + (devices ? ' · on ' + devices + ' other device' + (devices === 1 ? '' : 's') : '');
+    enable.hidden = false; test.hidden = true; disable.hidden = true;
+  }
+  hint.textContent = 'Reminders and habit windows arrive here even when the app is closed.';
+}
+async function enablePush(){
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { toast(perm === 'denied' ? 'Notifications are blocked for this site' : 'Notifications not enabled'); return refreshPushUI(); }
+    const key = await api('/api/push/vapid');
+    if (!key.ok) { toast('Notifications aren’t available on the server right now'); return; }
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToU8(key.body.publicKey) });
+    const tz = (Intl.DateTimeFormat().resolvedOptions() || {}).timeZone || 'UTC';
+    const r = await api('/api/push/subscribe', { method: 'POST', body: JSON.stringify({ subscription: sub.toJSON(), tz }) });
+    if (!r.ok) { toast('Couldn’t save this device for notifications'); return refreshPushUI(); }
+    toast('Notifications on ✓ — reminders will arrive on this device');
+  } catch (e) { toast('Couldn’t enable notifications: ' + (e && e.message ? e.message : 'unknown error')); }
+  refreshPushUI();
+}
+async function disablePush(){
+  try {
+    const sub = await currentPushSub();
+    if (sub) { await api('/api/push/unsubscribe', { method: 'POST', body: JSON.stringify({ endpoint: sub.endpoint }) }); await sub.unsubscribe(); }
+    toast('Notifications off on this device');
+  } catch (e) { toast('Couldn’t turn off notifications'); }
+  refreshPushUI();
+}
+async function testPush(){
+  let r; try { r = await api('/api/push/test', { method: 'POST', body: '{}' }); } catch (e) { r = { ok: false }; }
+  toast(r.ok && r.body && r.body.sent > 0 ? 'Test sent — check your notifications' : 'No device received the test');
 }
 
 /* ================= events ================= */
@@ -1384,6 +1546,9 @@ function bindEvents(){
   $('auth-close').addEventListener('click', () => { $('auth-overlay').hidden = true; });
   $('auth-logout').addEventListener('click', doLogout);
   $('auth-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
+  $('push-enable').addEventListener('click', enablePush);
+  $('push-disable').addEventListener('click', disablePush);
+  $('push-test').addEventListener('click', testPush);
 
   document.querySelectorAll('.overlay').forEach(ov => {
     ov.addEventListener('mousedown', (e) => { if (e.target === ov) ov.hidden = true; });
@@ -1397,6 +1562,7 @@ function bindEvents(){
 bindEvents();
 render();
 store.init();
+if (WEB && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 setInterval(() => {
   const t = todayStr();
   if (t !== today) { today = t; calY = calM = null; render(); }
