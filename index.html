@@ -1253,6 +1253,7 @@ async function submitAuth(){
       r.status === 401 ? 'Wrong email or password.' :
       r.status === 429 ? 'Too many attempts — wait a few minutes and try again.' :
       r.status === 400 ? 'Check the email and password and try again.' :
+      r.status === 503 ? 'The server’s storage is starting up — try again in a minute.' :
       "Couldn't reach the server — try again.";
     return;
   }

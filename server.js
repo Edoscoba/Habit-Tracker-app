@@ -10,8 +10,37 @@ const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.PG_URL || '';
+const DATABASE_URL = (process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.PG_URL || '').trim();
 const HAS_PG_VARS = !!(DATABASE_URL || process.env.PGHOST || process.env.PGHOST_UNIX);
+
+/* ---- diagnostics helpers (never include credentials) ---- */
+function sanitizeUrl(url){
+  try { const u = new URL(url); return u.protocol + '//' + (u.username ? '***@' : '') + u.host + u.pathname; }
+  catch (e) { return '(unparseable url)'; }
+}
+function errDetail(e){
+  const parts = [];
+  if (e && e.code) parts.push(e.code);
+  if (e && e.message) parts.push(e.message);
+  if (e && Array.isArray(e.errors) && e.errors.length) parts.push('[' + e.errors.map(x => (x && (x.code || x.message)) || String(x)).join(', ') + ']');
+  const s = parts.join(' ').trim();
+  return s || String(e);
+}
+/* The container's default gateway is the host on this docker network —
+ * the right target when a connection string says "localhost" (meaning
+ * the host machine, not this container). */
+function dockerGatewayIp(){
+  try {
+    const lines = fs.readFileSync('/proc/net/route', 'utf8').split('\n');
+    for (const line of lines.slice(1)) {
+      const f = line.trim().split(/\s+/);
+      if (f.length > 2 && f[1] === '00000000' && f[2] && f[2] !== '00000000') {
+        return [6, 4, 2, 0].map(i => parseInt(f[2].slice(i, i + 2), 16)).join('.');
+      }
+    }
+  } catch (e) {}
+  return null;
+}
 const SESSION_DAYS = 120;
 const MAX_HABITS = 50;
 const MAX_BODY = 256 * 1024;
@@ -140,9 +169,61 @@ class SqliteStore {
 
 class PgStore {
   constructor(url){ this.url = url; this.kind = 'postgres'; }
+
+  /* Build connection candidates. Managed single-host platforms often hand
+   * out a "localhost" connection string that is only valid on the host —
+   * from inside the app container the host is the docker gateway. Try the
+   * string as given, then gateway/host aliases, each without and with TLS. */
+  buildCandidates(){
+    const url = this.url;
+    const sslEnv = String(process.env.PGSSL || '').toLowerCase();
+    const forceSsl = /sslmode=(require|verify|prefer)/i.test(url) || ['1', 'true', 'require', 'yes', 'on'].includes(sslEnv);
+    const noSsl = ['0', 'false', 'no', 'off', 'disable'].includes(sslEnv) || /sslmode=disable/i.test(url);
+    const sslOrder = noSsl ? [false] : (forceSsl ? [true, false] : [false, true]);
+    const mk = (theUrl, ssl) => ({
+      config: ssl ? { connectionString: theUrl, ssl: { rejectUnauthorized: false } } : { connectionString: theUrl },
+      label: sanitizeUrl(theUrl) + (ssl ? ' +tls' : ' no-tls')
+    });
+    if (!url) return sslOrder.map(ssl => ({ config: ssl ? { ssl: { rejectUnauthorized: false } } : {}, label: 'PG* env vars' + (ssl ? ' +tls' : ' no-tls') }));
+    const out = [];
+    for (const ssl of sslOrder) out.push(mk(url, ssl));
+    let u = null; try { u = new URL(url); } catch (e) {}
+    const host = u ? u.hostname : '';
+    if (u && (host === 'localhost' || host === '127.0.0.1' || host === '::1')) {
+      const alts = [];
+      const gw = dockerGatewayIp(); if (gw) alts.push(gw);
+      alts.push('host.docker.internal', '172.17.0.1');
+      for (const h of [...new Set(alts)]) {
+        if (h === host) continue;
+        const v = new URL(url); v.hostname = h;
+        for (const ssl of sslOrder) out.push(mk(v.toString(), ssl));
+      }
+    }
+    return out;
+  }
+
   async init(){
     const { Pool } = require('pg');
-    this.pool = new Pool(Object.assign(pgConnConfig(this.url), { max: 8, idleTimeoutMillis: 30000 }));
+    let lastErr = null;
+    for (const cand of this.buildCandidates()) {
+      const pool = new Pool(Object.assign({}, cand.config, { max: 8, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 }));
+      try {
+        const probe = await pool.connect();
+        try { await probe.query('SELECT 1'); } finally { probe.release(); }
+        this.pool = pool;
+        console.log('Postgres connected via ' + cand.label);
+        await this.ensureSchema();
+        return;
+      } catch (e) {
+        lastErr = e;
+        console.error('Postgres candidate failed — ' + cand.label + ': ' + errDetail(e));
+        await pool.end().catch(() => {});
+      }
+    }
+    throw lastErr || new Error('no postgres connection candidates');
+  }
+
+  async ensureSchema(){
     const c = await this.pool.connect();
     try {
       await c.query(`
@@ -262,21 +343,8 @@ class PgStore {
   }
 }
 
-// Build a pg connection config from a URL, enabling SSL for managed
-// providers. SSL on unless the URL/host is local or PGSSL disables it.
-function pgConnConfig(url){
-  const cfg = { connectionString: url };
-  let host = '';
-  try { host = new URL(url).hostname; } catch (e) {}
-  const local = host === 'localhost' || host === '127.0.0.1' || host === '' || host === '::1';
-  const sslEnv = String(process.env.PGSSL || '').toLowerCase();
-  const wantsSsl = /sslmode=(require|verify|prefer)/i.test(url) || ['1', 'true', 'require', 'yes', 'on'].includes(sslEnv);
-  const disablesSsl = ['0', 'false', 'no', 'off', 'disable'].includes(sslEnv) || /sslmode=disable/i.test(url);
-  if (!disablesSsl && (wantsSsl || !local)) cfg.ssl = { rejectUnauthorized: false };
-  return cfg;
-}
-
 let store;
+let storageReady = false;
 
 /* =========================================================================
  * shared helpers, validation, auth crypto — backend-independent
@@ -382,6 +450,7 @@ function send(res, code, obj, extraHeaders){
  * HTTP API
  * ========================================================================= */
 async function handleApi(req, res, pathname){
+  if (!storageReady) return send(res, 503, { error: 'storage_unavailable' });
   const method = req.method;
   const mutating = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
   if (mutating && req.headers['x-dh'] !== '1') return send(res, 403, { error: 'missing_header' });
@@ -492,15 +561,25 @@ const server = http.createServer((req, res) => {
   res.end(req.method === 'HEAD' ? undefined : page);
 });
 
+/* Serve immediately; bring storage up in the background and retry until it
+ * connects. Guests are unaffected while storage is down — the sync API
+ * answers 503 storage_unavailable until it is ready. */
 (async () => {
   const usePg = HAS_PG_VARS;
   store = usePg ? new PgStore(DATABASE_URL) : new SqliteStore(DATA_DIR);
-  try {
-    await store.init();
-  } catch (e) {
-    console.error('Storage init failed (' + store.kind + '): ' + (e && e.message));
-    if (usePg) { console.error('Check DATABASE_URL and that the Postgres database is reachable.'); }
-    process.exit(1);
+  server.listen(PORT, () => console.log('Daily Habit listening on port ' + PORT + ' [storage: ' + store.kind + ', initializing]'));
+  for (;;) {
+    try {
+      await store.init();
+      storageReady = true;
+      console.log('Storage ready [storage: ' + store.kind + (usePg ? '' : ', ' + DATA_DIR) + ']');
+      return;
+    } catch (e) {
+      console.error('Storage init failed (' + store.kind + '): ' + errDetail(e));
+      console.error(usePg
+        ? 'Sync API disabled until the database is reachable (guests unaffected). Retrying in 15s — check DATABASE_URL and network/TLS.'
+        : 'Sync API disabled until storage works (guests unaffected). Retrying in 15s — check that DATA_DIR is writable.');
+      await new Promise(r => setTimeout(r, 15000));
+    }
   }
-  server.listen(PORT, () => console.log('Daily Habit listening on port ' + PORT + ' [storage: ' + store.kind + (usePg ? '' : ', ' + DATA_DIR) + ']'));
 })();

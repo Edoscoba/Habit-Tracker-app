@@ -1,6 +1,6 @@
 {
   "name": "daily-habit",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Daily Habit — streak tracker with optional accounts and cross-device sync (SQLite or Postgres)",
   "main": "server.js",
   "scripts": {
