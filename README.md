@@ -85,6 +85,15 @@ Data model: `remindMin`, `winStartMin`, `winEndMin` are minutes since
 midnight (0–1439). Databases created by v3.1 (whole-hour columns) are
 migrated automatically on first start.
 
+## Streak rules
+
+- Check in every day: **a past day with no check-in counts as missed** (from the
+  day the habit was created, or its earliest logged day). It breaks the streak,
+  counts against the 30-day success rate and shows in the calendar with a dashed
+  ✕. Today stays pending until it is over.
+- Tap any past day in the calendar to correct it (Did it / Missed / Skipped).
+  Skipped days bridge a streak without counting.
+
 ## How accounts work
 
 - Optional: guests use the app with data stored in their browser, no sign-up.

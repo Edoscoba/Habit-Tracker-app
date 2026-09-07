@@ -299,6 +299,9 @@
   .cal-cell.y::after { content: "✓"; position: absolute; right: 3px; bottom: 1px; font-size: 8px; font-weight: 900; }
   .cal-cell.n { box-shadow: inset 0 0 0 2px var(--bad); color: var(--bad); font-weight: 800; }
   .cal-cell.n::after { content: "✕"; position: absolute; right: 4px; bottom: 1px; font-size: 8px; font-weight: 900; }
+  /* a past day with no check-in counts as missed: same mark, dashed ring */
+  .cal-cell.n.auto { box-shadow: none; border: 2px dashed color-mix(in srgb, var(--bad) 75%, transparent); }
+  .lg-n.auto { box-shadow: none; border: 2px dashed color-mix(in srgb, var(--bad) 75%, transparent); }
   .cal-cell .note-dot { position: absolute; left: 50%; transform: translateX(-50%); bottom: 3px; width: 4px; height: 4px; border-radius: 50%; background: currentColor; opacity: .85; }
   .cal-legend { display: flex; gap: 14px; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line);
     font-size: 11px; font-weight: 700; color: var(--sub); flex-wrap: wrap; }
@@ -628,8 +631,21 @@ const habitList = () => Object.keys(state.habits)
   .sort((a, b) => (ord(a) - ord(b)) || (a.createdAt || '').localeCompare(b.createdAt || '') || a.id.localeCompare(b.id));
 const daysOf = (id) => (state.logs[id] && state.logs[id].days) || {};
 
-/* ================= streak math ================= */
-function computeStats(days){
+/* ================= streak math =================
+ * Rule: a past day with no check-in counts as MISSED ('n') from the habit's
+ * first day on. Today stays pending until it is over; future days are blank. */
+function habitStart(h, days){
+  let s = h && h.createdAt ? String(h.createdAt).slice(0, 10) : today;
+  for (const k in days) if (k < s && (days[k] === 'y' || days[k] === 'n' || days[k] === 's')) s = k;
+  return s;
+}
+function effVal(h, days, date, start){
+  const v = days[date];
+  if (v === 'y' || v === 'n' || v === 's') return v;
+  if (date < today && date >= (start || habitStart(h, days))) return 'n';
+  return undefined;
+}
+function computeStats(days, h){
   /* current streak: 'y' counts, 's' (skip) bridges without counting,
      'n' breaks, an unlogged past day breaks; an unlogged today is pending. */
   let cur = 0, d = today, pendingToday = false;
@@ -657,9 +673,10 @@ function computeStats(days){
   }
   if (cur > best) best = cur;
 
-  /* 30-day success rate: y / (y + n); skips are neutral */
+  /* 30-day success rate: y / (y + n); skips are neutral; unlogged past days count as misses */
   let y30 = 0, n30 = 0, dd = today;
-  for (let i = 0; i < 30; i++) { const v = days[dd]; if (v === 'y') y30++; else if (v === 'n') n30++; dd = prevDate(dd); }
+  const start = habitStart(h, days);
+  for (let i = 0; i < 30; i++) { const v = effVal(h, days, dd, start); if (v === 'y') y30++; else if (v === 'n') n30++; dd = prevDate(dd); }
   const rate30 = (y30 + n30) > 0 ? Math.round(100 * y30 / (y30 + n30)) : null;
 
   const mPrefix = today.slice(0, 7);
@@ -893,7 +910,7 @@ function renderRecap(){
   for (const k of sortedWins) if (dayWins[k] > bestN) { bestN = dayWins[k]; bestDay = WDAYS[(parseDate(k).getDay() + 6) % 7]; }
   let close = null;
   for (const h of list) {
-    const st = computeStats(daysOf(h.id));
+    const st = computeStats(daysOf(h.id), h);
     if (st.current > 0) {
       const m = MILESTONES.find(x => x > st.current);
       if (m) { const gap = m - st.current; if (!close || gap < close.gap) close = { gap, m, h }; }
@@ -948,9 +965,9 @@ function renderToday(){
   const p = todayProgress();
   $('today-sub').textContent = p.handled === p.total
     ? 'All checked in for today — see you tomorrow! 🎉'
-    : 'Check in on each habit to keep your streaks alive. Tap a habit to add a note or skip the day.';
+    : 'Check in on each habit before the day ends — a day without a check-in counts as missed. Tap a habit to add a note or skip the day.';
   box.innerHTML = '<div class="card today-card">' + list.map(h => {
-    const days = daysOf(h.id), st = computeStats(days), v = days[today];
+    const days = daysOf(h.id), st = computeStats(days, h), v = days[today];
     let actions;
     if (v === 'y') {
       actions = '<span class="state-chip state-yes">' + (h.type === 'good' ? 'Done' : 'Clean') + ' ✓</span>' +
@@ -1060,7 +1077,7 @@ function renderDetail(){
 }
 
 function renderTiles(h){
-  const days = daysOf(h.id), st = computeStats(days), v = days[today];
+  const days = daysOf(h.id), st = computeStats(days, h), v = days[today];
   const unit = (st.current === 1 ? 'day' : 'days') + (h.type === 'bad' ? ' clean' : '');
   let note;
   if (v === 'y') note = 'You showed up today — nice!';
@@ -1086,17 +1103,19 @@ function renderCalendar(h){
   const nDays = new Date(calY, calM + 1, 0).getDate();
   const td = parseDate(today);
   const atCurrent = calY === td.getFullYear() && calM === td.getMonth();
+  const start = habitStart(h, days);
   let cells = WDAYS.map(w => '<span class="cal-wd">' + w[0] + '</span>').join('');
   for (let i = 0; i < lead; i++) cells += '<span></span>';
   for (let d = 1; d <= nDays; d++) {
     const ds = calY + '-' + String(calM + 1).padStart(2, '0') + '-' + String(d).padStart(2, '0');
-    const v = days[ds];
+    const v = effVal(h, days, ds, start), auto = v === 'n' && days[ds] !== 'n';
     const future = ds > today;
     let cls = 'cal-cell';
     if (ds === today) cls += ' today';
-    if (v === 'y') cls += ' y'; else if (v === 'n') cls += ' n'; else if (v === 's') cls += ' s';
+    if (v === 'y') cls += ' y'; else if (v === 'n') cls += ' n' + (auto ? ' auto' : ''); else if (v === 's') cls += ' s';
     const hasNote = !future && (state.notes[ds] || '').trim() !== '';
-    const stateWord = v === 'y' ? (h.type === 'good' ? 'done' : 'clean') : v === 'n' ? (h.type === 'good' ? 'missed' : 'slipped') : v === 's' ? 'skipped' : 'not logged';
+    const missWord = h.type === 'good' ? 'missed' : 'slipped';
+    const stateWord = v === 'y' ? (h.type === 'good' ? 'done' : 'clean') : v === 'n' ? (auto ? 'no check-in, counted as ' + missWord : missWord) : v === 's' ? 'skipped' : 'not logged';
     cells += '<button class="' + cls + '"' + (future ? ' disabled' : ' data-date="' + ds + '"') +
       ' aria-label="' + MONTHS_S[calM] + ' ' + d + ': ' + stateWord + (hasNote ? ', has note' : '') + '">' +
       d + (hasNote ? '<span class="note-dot"></span>' : '') + '</button>';
@@ -1110,6 +1129,7 @@ function renderCalendar(h){
     '<div class="cal-legend">' +
       '<span class="k"><span class="lg-y">✓</span>' + (h.type === 'good' ? 'did it' : 'clean day') + '</span>' +
       '<span class="k"><span class="lg-n">✕</span>' + (h.type === 'good' ? 'missed' : 'slipped') + '</span>' +
+      '<span class="k"><span class="lg-n auto">✕</span>no check-in = ' + (h.type === 'good' ? 'missed' : 'slipped') + '</span>' +
       '<span class="k"><span class="lg-s">–</span>skipped</span>' +
       '<span class="k"><span class="lg-dot"></span>has a note</span>' +
       '<span class="k" style="color:var(--faint)">tap a day to edit</span>' +
@@ -1234,7 +1254,7 @@ async function checkIn(id, val){
 
 function celebrate(id){
   const h = state.habits[id]; if (!h) return;
-  const st = computeStats(daysOf(id));
+  const st = computeStats(daysOf(id), h);
   if (MILESTONES.indexOf(st.current) !== -1) {
     confetti();
     toast('🔥 ' + st.current + '-day streak on ' + h.name + '!');
@@ -1352,6 +1372,10 @@ function openDay(date){
   $('day-sub').textContent = h.emoji + ' ' + h.name;
   $('day-yes').textContent = h.type === 'good' ? '✓ Did it' : '✓ Stayed clean';
   $('day-no').textContent = h.type === 'good' ? '✕ Missed' : '✕ Slipped';
+  const countsAsMiss = date < today && date >= habitStart(h, daysOf(selectedId));   // unlogged past day = missed
+  $('day-clear').innerHTML = countsAsMiss
+    ? '— No check-in<small>counts as ' + (h.type === 'good' ? 'missed' : 'slipped') + '</small>'
+    : '— Not logged';
   paintDaySeg();
   $('day-note').value = state.notes[date] || '';
   $('day-overlay').hidden = false;
